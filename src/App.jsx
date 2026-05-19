@@ -1190,7 +1190,7 @@ function DuelTab({ rules, updateRule, requestCopy }) {
   // battle: {
   //   me: { hp, stamina, focus, str, agi },
   //   ai: { hp, stamina, focus, str, agi, name },
-  //   round, currentTurn ("me_attack" | "me_defense" | "ai_attack" | "ai_defense" | "round_end"),
+  //   round, currentTurn ("me_attack" | "me_defense" | "ai_attack" | "ai_attack_done" | "ai_defense" | "round_end"),
   //   log: [...],
   //   pendingAttacks: [...] (현재 처리 중인 공격들),
   //   pendingMyAttack: [...] (내가 선언한 공격, 더블이면 길이 2),
@@ -1199,6 +1199,25 @@ function DuelTab({ rules, updateRule, requestCopy }) {
   //   history: [...] (리플레이용 상태 스냅샷),
   //   undoSnapshot: {...} (직전 상태)
   // }
+
+  // currentTurn 변화 감시 — AI 행동/턴 진행을 useEffect에서 일원화 처리.
+  // setBattle 콜백 안에선 부수효과 일으키지 않음으로써 Strict Mode 더블 실행 방지.
+  useEffect(() => {
+    if (!battle || battle.ended) return;
+
+    // AI 공격 차례: triggerAIAttack 한 번만 발동
+    if (battle.currentTurn === "ai_attack") {
+      const t = setTimeout(() => triggerAIAttack(), aiSpeed);
+      return () => clearTimeout(t);
+    }
+
+    // AI 휴식 등으로 ai_attack_done 진입 — 다음 단계 진행
+    if (battle.currentTurn === "ai_attack_done") {
+      setBattle(prev => prev ? advanceTurn(prev, "ai_attack_done") : prev);
+      return;
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [battle?.currentTurn, battle?.round]);
 
   // 대전 시작
   const startBattle = () => {
@@ -1241,17 +1260,19 @@ function DuelTab({ rules, updateRule, requestCopy }) {
     };
     setBattle(newBattle);
     setScreen("battle");
-
-    // AI 선공이면 자동으로 AI 행동 시작
-    if (firstActor === "ai") {
-      setTimeout(() => triggerAIAttack(newBattle), aiSpeed);
-    }
+    // AI 선공이면 useEffect가 자동으로 triggerAIAttack 실행
   };
 
   // === AI가 공격할 때 ===
-  const triggerAIAttack = (b) => {
+  // state setter 콜백은 순수해야 하므로, 여기선 상태 transition만 처리.
+  // 후속 turn 진행은 useEffect가 currentTurn을 감지해 처리.
+  const triggerAIAttack = () => {
     setBattle(prev => {
-      const cur = prev || b;
+      if (!prev) return prev;
+      // 이미 다른 단계로 진입했거나 종료된 경우 무시 (중복 호출 방어)
+      if (prev.currentTurn !== "ai_attack" || prev.ended) return prev;
+
+      const cur = prev;
       const ai = cur.ai, me = cur.me;
       const attacks = chooseAttacks(ai, me, rules);
       const thinking = generateThinking(ai, me, rules, attacks, "attack");
@@ -1259,20 +1280,26 @@ function DuelTab({ rules, updateRule, requestCopy }) {
                     : attacks[0] === "heavy" ? "attack_heavy"
                     : attacks[0] === "normal" ? "attack_normal"
                     : "attack_probe";
+
+      // AI 위기 모드(HP<30) + 공격적 행동 시 시각 효과 플래그
+      const isCrisis = ai.hp < 30 && attacks[0] !== "rest";
+      const isAggressive = attacks.includes("heavy") || attacks.length > 1;
+      const crisisFlag = isCrisis && isAggressive;
+
       const newLog = [...cur.log,
-        useCheeryTone ? { type: "ai_speech", text: pickLine(lineKey) } : null,
+        useCheeryTone ? { type: "ai_speech", text: pickLine(lineKey), crisis: crisisFlag } : null,
         showAIThinking ? { type: "ai_think", text: thinking } : null,
-        { type: "ai_declare", attacks, round: cur.round },
+        { type: "ai_declare", attacks, round: cur.round, crisis: crisisFlag },
       ].filter(Boolean);
 
-      // 휴식이면 즉시 처리
+      // 휴식 — 자원 회복하고 곧바로 "AI 행동 종료" 단계로
       if (attacks.length === 1 && attacks[0] === "rest") {
         const aiNext = { ...ai, stamina: Math.min(rules.resources.staminaMax, ai.stamina + rules.resources.restRecoverBonus + rules.resources.baseRecover) };
         const counts = { ...cur.aiActionCounts, rest: cur.aiActionCounts.rest + 1 };
-        const next = {
+        return {
           ...cur, ai: aiNext, log: newLog, aiActionCounts: counts,
+          currentTurn: "ai_attack_done", // useEffect가 다음 단계 진행
         };
-        return advanceTurn(next, "ai_attack_done");
       }
       // 자원 차감 + 카운트
       let staminaUsed = 0;
@@ -1287,7 +1314,7 @@ function DuelTab({ rules, updateRule, requestCopy }) {
         ai: aiNext,
         log: newLog,
         aiActionCounts: counts,
-        pendingAttacks: attacks, // 사용자가 방어해야 할 AI 공격들
+        pendingAttacks: attacks,
         pendingDefenseIndex: 0,
         currentTurn: "me_defense",
       };
@@ -1442,7 +1469,6 @@ function DuelTab({ rules, updateRule, requestCopy }) {
     if (state.me.hp <= 0 || state.ai.hp <= 0) {
       const winner = state.me.hp <= 0 && state.ai.hp <= 0 ? "draw"
                    : state.me.hp <= 0 ? "ai" : "me";
-      // 통계 저장 트리거
       setTimeout(() => recordStats(state.ai.buildId, winner, state.round, state.myActionCounts, state.aiActionCounts), 0);
       return { ...state, ended: true, winner, currentTurn: "ended" };
     }
@@ -1450,12 +1476,9 @@ function DuelTab({ rules, updateRule, requestCopy }) {
     // me_attack_done → 두 번째 행동자 차례
     if (completedPhase === "me_attack_done") {
       if (state.firstActor === "me" && !state.firstDone) {
-        // 후공 AI 차례
-        const next = { ...state, firstDone: true, currentTurn: "ai_attack" };
-        setTimeout(() => triggerAIAttack(next), aiSpeed);
-        return next;
+        // 후공 AI 차례 — useEffect가 발동
+        return { ...state, firstDone: true, currentTurn: "ai_attack" };
       } else {
-        // 라운드 종료
         return endRound(state);
       }
     }
@@ -1464,7 +1487,6 @@ function DuelTab({ rules, updateRule, requestCopy }) {
         // 후공 나 차례
         return { ...state, firstDone: true, currentTurn: "me_attack" };
       } else {
-        // 라운드 종료
         return endRound(state);
       }
     }
@@ -1473,7 +1495,6 @@ function DuelTab({ rules, updateRule, requestCopy }) {
 
   // 라운드 종료 처리 (자원 회복 + 다음 라운드)
   const endRound = (state) => {
-    // 회복 — 휴식은 이미 처리됨. 여기선 기본 회복만.
     const baseRec = rules.resources.baseRecover;
     const meRec = { ...state.me,
       stamina: Math.min(rules.resources.staminaMax, state.me.stamina + baseRec),
@@ -1483,7 +1504,7 @@ function DuelTab({ rules, updateRule, requestCopy }) {
       stamina: Math.min(rules.resources.staminaMax, state.ai.stamina + baseRec),
       focus: Math.min(rules.resources.focusMax, state.ai.focus + baseRec),
     };
-    const next = {
+    return {
       ...state,
       me: meRec, ai: aiRec,
       round: state.round + 1,
@@ -1491,10 +1512,7 @@ function DuelTab({ rules, updateRule, requestCopy }) {
       currentTurn: state.firstActor === "me" ? "me_attack" : "ai_attack",
       log: [...state.log, { type: "round_end", round: state.round }],
     };
-    if (next.firstActor === "ai") {
-      setTimeout(() => triggerAIAttack(next), aiSpeed);
-    }
-    return next;
+    // AI 선공이면 useEffect가 다음 라운드 시작 시 자동 발동
   };
 
   // 무르기
@@ -1662,7 +1680,7 @@ function DuelSetupScreen({
 
   return (
     <div className="max-w-md mx-auto">
-      <h2 className="text-lg font-bold mb-3 px-2">1:1 대전 설정</h2>
+      <h2 className="text-lg font-bold mb-3 px-2 text-zinc-100">1:1 대전 설정</h2>
 
       <Section title="내 캐릭터" accent="blue">
         <StatSpinner label="근력" value={myChar.str} onChange={v => setMyChar({ ...myChar, str: v })} />
@@ -1795,7 +1813,7 @@ function DuelBattleScreen({
   const A = rules.attack;
 
   return (
-    <div className="max-w-md mx-auto bg-zinc-950 rounded-xl border border-zinc-800 overflow-hidden flex flex-col relative" style={{ height: "calc(100vh - 100px)", minHeight: "640px" }}>
+    <div className="max-w-md mx-auto bg-zinc-950 rounded-xl border border-zinc-800 overflow-hidden flex flex-col relative" style={{ height: "calc(100dvh - 80px)", minHeight: "640px" }}>
       {/* 헤더 */}
       <div className="px-4 py-2.5 border-b border-zinc-800 flex items-center justify-between bg-zinc-950 flex-shrink-0">
         <button onClick={onExit} className="text-zinc-500 text-xs">← 나가기</button>
@@ -1873,7 +1891,9 @@ function DuelBattleScreen({
         )}
         {battle.currentTurn === "me_defense" && (
           <MyDefensePanel rules={rules} me={me}
+            ai={battle.ai}
             incoming={battle.pendingAttacks[battle.pendingDefenseIndex || 0]}
+            allIncoming={battle.pendingAttacks}
             isSecond={(battle.pendingDefenseIndex || 0) > 0}
             onChoose={onMyDefenseChoose}/>
         )}
@@ -2006,19 +2026,27 @@ function LogEntry({ entry: l }) {
   }
   if (l.type === "ai_declare") {
     const actText = l.attacks.map(a => atkLabels[a]).join(" + ");
+    const cls = l.crisis
+      ? "max-w-[80%] bg-rose-900/40 border-2 border-rose-600 rounded-2xl rounded-bl-md px-2.5 py-1.5 crisis-shake crisis-pulse"
+      : "max-w-[80%] bg-amber-900/30 border border-amber-800 rounded-2xl rounded-bl-md px-2.5 py-1.5";
+    const textCls = l.crisis ? "text-[10px] text-rose-200 font-bold" : "text-[10px] text-amber-300";
     return (
       <div className="flex justify-start">
-        <div className="max-w-[80%] bg-amber-900/30 border border-amber-800 rounded-2xl rounded-bl-md px-2.5 py-1.5">
-          <div className="text-[10px] text-amber-300">AI → {actText}</div>
+        <div className={cls}>
+          <div className={textCls}>AI → {actText}{l.crisis ? " ⚠" : ""}</div>
         </div>
       </div>
     );
   }
   if (l.type === "ai_speech") {
+    const cls = l.crisis
+      ? "max-w-[80%] bg-rose-950/60 border-2 border-rose-700 rounded-2xl rounded-bl-sm px-2.5 py-1.5 crisis-shake"
+      : "max-w-[80%] bg-zinc-800/80 border border-zinc-700 rounded-2xl rounded-bl-sm px-2.5 py-1.5";
+    const textCls = l.crisis ? "text-[11px] text-rose-200 italic font-semibold" : "text-[11px] text-amber-200 italic";
     return (
       <div className="flex justify-start">
-        <div className="max-w-[80%] bg-zinc-800/80 border border-zinc-700 rounded-2xl rounded-bl-sm px-2.5 py-1.5">
-          <div className="text-[11px] text-amber-200 italic">"{l.text}"</div>
+        <div className={cls}>
+          <div className={textCls}>"{l.text}"</div>
         </div>
       </div>
     );
@@ -2152,15 +2180,28 @@ function MyComboPanel({ rules, me, firstAction, onChoose }) {
 }
 
 // 방어 선언 패널
-function MyDefensePanel({ rules, me, incoming, isSecond, onChoose }) {
+function MyDefensePanel({ rules, me, ai, incoming, allIncoming, isSecond, onChoose }) {
   const D = rules.defense;
   const aff = (k) => D[k].enabled && me.focus >= D[k].cost;
   const atkLabels = { probe: "견제", normal: "일반공", heavy: "강공" };
   const dmg = rules.attack[incoming]?.damage;
+
+  // AI 위기 + 공격적 행동 시 시각 효과
+  const isCrisis = ai && ai.hp < 30;
+  const isAggressive = incoming === "heavy" || (allIncoming && allIncoming.length > 1);
+  const crisisFlag = isCrisis && isAggressive;
+
+  const boxCls = crisisFlag
+    ? "bg-rose-950/60 border-2 border-rose-500 rounded-md px-2.5 py-1.5 mb-2 crisis-shake crisis-pulse"
+    : "bg-rose-950/40 border border-rose-700 rounded-md px-2.5 py-1.5 mb-2";
+
   return (
     <>
-      <div className="bg-rose-950/40 border border-rose-700 rounded-md px-2.5 py-1.5 mb-2">
-        <div className="text-[10px] text-rose-400 mb-0.5">들어오는 공격: <span className="font-bold text-rose-200">{atkLabels[incoming]}</span> (데미지 {dmg})</div>
+      <div className={boxCls}>
+        <div className="text-[10px] text-rose-400 mb-0.5">
+          들어오는 공격: <span className="font-bold text-rose-200">{atkLabels[incoming]}</span> (데미지 {dmg})
+          {crisisFlag && <span className="ml-1 text-rose-300 font-bold">⚠ 발악</span>}
+        </div>
       </div>
       <div className="text-[9px] text-zinc-500 uppercase tracking-widest mb-1.5">방어 선언 {isSecond && "(2번째)"}</div>
       <div className="grid grid-cols-3 gap-1.5">
@@ -2288,7 +2329,7 @@ function DuelReplayScreen({ battle, onBack }) {
   const visibleLogs = battle.log.slice(0, cursor + 1);
 
   return (
-    <div className="max-w-md mx-auto bg-zinc-950 rounded-xl border border-zinc-800 overflow-hidden flex flex-col" style={{ height: "calc(100vh - 100px)", minHeight: "640px" }}>
+    <div className="max-w-md mx-auto bg-zinc-950 rounded-xl border border-zinc-800 overflow-hidden flex flex-col" style={{ height: "calc(100dvh - 80px)", minHeight: "640px" }}>
       <div className="px-4 py-2.5 border-b border-zinc-800 flex items-center justify-between bg-zinc-950 flex-shrink-0">
         <button onClick={onBack} className="text-zinc-500 text-xs">← 결과로</button>
         <span className="text-sm font-semibold">🎬 리플레이</span>
@@ -2418,10 +2459,27 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 p-3" style={{ fontFamily: '"Noto Sans KR", system-ui, sans-serif' }}>
+      <style>{`
+        @keyframes crisis-shake {
+          0%, 100% { transform: translateX(0); }
+          10%, 30%, 50%, 70%, 90% { transform: translateX(-3px); }
+          20%, 40%, 60%, 80% { transform: translateX(3px); }
+        }
+        .crisis-shake {
+          animation: crisis-shake 0.55s ease-in-out;
+        }
+        @keyframes crisis-pulse {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(244, 63, 94, 0.5), 0 0 0 1px rgba(244, 63, 94, 0.7); }
+          50% { box-shadow: 0 0 12px 4px rgba(244, 63, 94, 0.7), 0 0 0 1px rgba(244, 63, 94, 1); }
+        }
+        .crisis-pulse {
+          animation: crisis-pulse 1.2s ease-in-out infinite;
+        }
+      `}</style>
       <div className="max-w-7xl mx-auto">
         {/* 헤더 + 탭 */}
         <div className="mb-3 flex items-center justify-between border-b border-zinc-800 pb-2">
-          <h1 className="text-base font-bold tracking-tight">Showtime</h1>
+          <h1 className="text-base font-bold tracking-tight text-zinc-100">Showtime</h1>
           <div className="flex gap-1">
             <button onClick={() => setTab("sim")}
               className={`px-3 py-1.5 rounded text-xs font-semibold transition ${tab === "sim" ? "bg-emerald-700 text-white" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"}`}>
