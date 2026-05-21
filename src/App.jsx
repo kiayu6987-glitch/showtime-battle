@@ -18,7 +18,7 @@ const INITIAL_RULES = {
     restRecoverBonus: 3,
   },
   attack: {
-    probe:  { enabled: true,  cost: 1, damage: 5,  rollFormula: { str: 8,  agi: 4, base: 40 } },
+    probe:  { enabled: true,  cost: 1, damage: 8,  rollFormula: { str: 8,  agi: 8, base: 40 } },
     normal: { enabled: true,  cost: 2, damage: 15, rollFormula: { str: 10, agi: 0, base: 50 } },
     heavy:  { enabled: true,  cost: 3, damage: 28, rollFormula: { str: 10, agi: 0, base: 40 } },
     rest:   { enabled: true },
@@ -54,18 +54,39 @@ function evalRoll(formula, str, agi) {
 function rollD100() { return Math.floor(Math.random() * 100) + 1; }
 
 // === AI 로직 v2 ===
-// 상황 판정: HP 비율 기반 4단계
-function judgeSituation(self, opponent, rules) {
-  const myRatio = self.hp / rules.hp;
-  const oppRatio = opponent.hp / rules.hp;
+// 페르소나 설정 — 빌드 역할에서 도출 (개선안 A)
+// 공격형: 공격적(위기 임계치↑, 더블 적극), 회피형: 신중(모으기 선호, 위기 임계치↓)
+function getPersona(self, difficulty = "normal") {
+  const role = judgeRole(self);
+  // 기본 페르소나
+  let p;
+  if (role === "aggressor") {
+    p = { crisisHp: 35, doubleEager: true, restAverse: true, counterEager: false, label: "공격형" };
+  } else if (role === "evader") {
+    p = { crisisHp: 25, doubleEager: false, restAverse: false, counterEager: true, label: "회피형" };
+  } else {
+    p = { crisisHp: 30, doubleEager: false, restAverse: false, counterEager: false, label: "균형형" };
+  }
+  // 난이도 보정 (개선안 B) — easy는 성향 약화, hard는 강화
+  if (difficulty === "easy") {
+    p = { ...p, doubleEager: false, counterEager: false, useOpponentInfo: false, mistakeRate: 0.25 };
+  } else if (difficulty === "hard") {
+    p = { ...p, useOpponentInfo: true, mistakeRate: 0 };
+  } else {
+    p = { ...p, useOpponentInfo: false, mistakeRate: 0.08 };
+  }
+  return p;
+}
 
-  // 위기 — 절대 HP 30 미만
-  if (self.hp < 30) return "crisis";
-  // 우세 — 본인 HP가 상대보다 30% 이상 많음
+// 상황 판정: HP + 자원 통합 위협도 (개선안 6) + 페르소나 위기 임계치 (개선안 A)
+function judgeSituation(self, opponent, rules, persona = null) {
+  const crisisHp = persona ? persona.crisisHp : 30;
+  const dodgeCost = rules.defense.dodge.cost;
+  const lowDefense = self.focus < dodgeCost;
+  if (self.hp < crisisHp) return "crisis";
+  if (self.hp < 50 && lowDefense && opponent.hp > self.hp) return "crisis";
   if (self.hp > opponent.hp * 1.3) return "dominant";
-  // 열세 — 본인 HP가 상대보다 30% 이상 적음
   if (self.hp * 1.3 < opponent.hp) return "losing";
-  // 그 외
   return "even";
 }
 
@@ -81,46 +102,84 @@ function canUseCounter(self) {
   return self.str + self.agi >= 5;
 }
 
-// 빌드 정체성 + 상황 기반 AI: 공격 선택
-// 반환: [행동키, ...] (1개 또는 2개)
-// 추가 반환: thinking 텍스트 (1:1 모드에서 사용)
-function chooseAttacks(self, opponent, rules) {
+// 빌드 정체성 + 상황 + 자원 예측 + 페르소나 + 난이도 기반 AI: 공격 선택
+// opponentVisible: true면 상대 자원도 활용 (개선안 5, 공개 모드 전용)
+// difficulty: "easy" | "normal" | "hard" (개선안 B)
+function chooseAttacks(self, opponent, rules, opponentVisible = false, difficulty = "normal") {
+  const persona = getPersona(self, difficulty);
   const role = judgeRole(self);
-  const situation = judgeSituation(self, opponent, rules);
+  const situation = judgeSituation(self, opponent, rules, persona);
   const A = rules.attack;
   const stam = self.stamina;
 
-  // 자원으로 가능한 행동 헬퍼
+  // 난이도 — easy면 일정 확률로 실수(차선책 선택). hard면 상대 정보 강제 활용
+  const useOppInfo = opponentVisible && (persona.useOpponentInfo !== false || difficulty !== "easy");
+  const blunder = persona.mistakeRate && Math.random() < persona.mistakeRate;
+
   const canAfford = (k) => A[k].enabled && stam >= A[k].cost;
   const canAffordCombo = (k1, k2) => A[k1].enabled && A[k2].enabled && stam >= A[k1].cost + A[k2].cost;
 
-  // 위기 모드 — 모든 빌드 공통: 강공 강행, 자원 부족하면 강행 페널티 감수
+  // 다음 라운드 예측 (개선안 3) — 더블/콤보 후 다음 행동 가능한가
+  const baseRec = rules.resources.baseRecover;
+  const heavyCost = A.heavy.cost;
+  const normalCost = A.normal.cost;
+
+  // 상대 자원 활용 (개선안 5): 공개 모드 + 상대 집중력 부족 → push
+  const dodgeCost = rules.defense.dodge.cost;
+  const counterCost = rules.defense.counter.cost;
+  const blockCost = rules.defense.block.cost;
+  const opponentLowDefense = useOppInfo && opponent.focus < dodgeCost;
+
+  // 개선안 C — 자원 임계점 감지 (공개 모드):
+  const oppCanDodge = useOppInfo && opponent.focus >= dodgeCost;
+  const oppCanCounter = useOppInfo && opponent.focus >= counterCost;
+  const opponentDefenseless = useOppInfo && !oppCanDodge && !oppCanCounter;
+  const opponentNextStillWeak = useOppInfo && (opponent.focus + baseRec) < dodgeCost;
+
+  // 난이도 — easy 실수: 강공 가능해도 일반/견제로 한 수 무름
+  if (blunder && situation !== "crisis") {
+    if (canAfford("normal")) return ["normal"];
+    if (canAfford("probe")) return ["probe"];
+  }
+
+  // 위기 모드
   if (situation === "crisis") {
     if (canAffordCombo("heavy", "normal")) return ["heavy", "normal"];
     if (canAfford("heavy")) return ["heavy"];
     if (canAfford("normal")) return ["normal"];
-    if (A.heavy.enabled) return ["heavy"]; // 강행 (자원 마이너스)
+    if (A.heavy.enabled) return ["heavy"]; // 강행
     if (canAfford("probe")) return ["probe"];
     return ["probe"];
   }
 
-  // 우세 모드 — 자원 모으기 우선
+  // 우세 모드
   if (situation === "dominant") {
-    // 자원 거의 가득 차면 더블로 마무리 시도
+    // 개선안 C — 우세 + 상대 방어 무력화 윈도우면 모으기보다 강공 집중
+    if (opponentDefenseless && canAfford("heavy")) {
+      if (canAffordCombo("heavy", "normal")) return ["heavy", "normal"];
+      return ["heavy"];
+    }
     if (stam >= rules.resources.staminaMax - 1) {
       if (role === "aggressor" && canAffordCombo("heavy", "normal")) return ["heavy", "normal"];
       if (role === "aggressor" && canAffordCombo("heavy", "probe")) return ["heavy", "probe"];
       if (canAffordCombo("normal", "normal")) return ["normal", "normal"];
     }
-    // 평소엔 견제 (자원 모으기) — 단 휴식 옵션 있고 자원 적으면 휴식
+    // 개선안 E — 선제 휴식: 우세인데 자원이 바닥(1 이하)이면
+    // 작은 견제로 흘리지 말고 미리 휴식해 다음 라운드 큰 거 준비
+    if (A.rest.enabled && stam <= 1 && !opponentDefenseless) return ["rest"];
     if (A.rest.enabled && stam <= 2) return ["rest"];
     if (canAfford("probe")) return ["probe"];
     if (canAfford("normal")) return ["normal"];
     return ["probe"];
   }
 
-  // 열세 모드 — 즉시 데미지 우선
+  // 열세 모드
   if (situation === "losing") {
+    // 개선안 C — 열세라도 상대가 방어 무력화 상태면 강공 집중으로 반전
+    if (opponentDefenseless && canAfford("heavy")) {
+      if (canAffordCombo("heavy", "normal")) return ["heavy", "normal"];
+      return ["heavy"];
+    }
     if (role === "aggressor") {
       if (canAffordCombo("heavy", "normal")) return ["heavy", "normal"];
       if (canAfford("heavy")) return ["heavy"];
@@ -131,16 +190,42 @@ function chooseAttacks(self, opponent, rules) {
     return ["probe"];
   }
 
-  // 균형 모드 — 빌드 역할별 기본 패턴 + 자원량별 동적 콤보
-  if (rules.combo.doubleEnabled && stam >= rules.combo.doubleThreshold) {
+  // 균형 모드
+  // 개선안 C 강화 — 상대 방어 무력화 윈도우면 최대 화력
+  if (opponentDefenseless && canAfford("heavy")) {
+    if (canAffordCombo("heavy", "normal")) return ["heavy", "normal"];
+    return ["heavy"];
+  }
+  // 상대 방어 자원 부족(회피 불가) → 강공 push (개선안 5, 공개 모드만)
+  if (opponentLowDefense && canAfford("heavy")) {
+    if (canAffordCombo("heavy", "normal")) return ["heavy", "normal"];
+    return ["heavy"];
+  }
+
+  // 개선안 E — 균형 모드 선제 휴식:
+  // 자원이 거의 바닥(1 이하)이라 견제밖에 못 할 때, 견제로 흘리기보다
+  // 휴식으로 한 번에 회복해 다음 라운드 강공/더블 준비 (상대 위협 낮을 때만)
+  if (A.rest.enabled && role === "aggressor" && stam <= 1
+      && !opponentLowDefense && !opponentDefenseless && situation === "even") {
+    return ["rest"];
+  }
+
+  // 더블 콤보 + 다음 라운드 예측 (개선안 3) + 페르소나 doubleEager (개선안 A)
+  const doubleThresh = persona.doubleEager
+    ? Math.max(2, rules.combo.doubleThreshold - 1)  // 공격형은 더 적극적으로 더블
+    : rules.combo.doubleThreshold;
+  if (rules.combo.doubleEnabled && stam >= doubleThresh) {
     if (role === "aggressor") {
-      // 자원 6+ : 강공+일반 / 자원 5+ : 강공+견제 / 자원 4+ : 일반+일반
-      if (stam >= 6 && canAffordCombo("heavy", "normal")) return ["heavy", "normal"];
+      if (stam >= 6 && canAffordCombo("heavy", "normal")) {
+        // 더블 후 자원 = stam-5+baseRec. 다음 라운드 일반공(2) 이상 가능해야 콤보 가치 있음
+        const afterCombo = stam - heavyCost - normalCost + baseRec;
+        if (afterCombo >= normalCost) return ["heavy", "normal"];
+        // 그 외엔 단발로 절약
+      }
       if (stam >= 5 && canAffordCombo("heavy", "probe")) return ["heavy", "probe"];
       if (stam >= 4 && canAffordCombo("normal", "normal")) return ["normal", "normal"];
     }
     if (role === "evader") {
-      // 자원 5+ : 견제+일반 / 자원 4+ : 견제+견제 (저비용 회전)
       if (stam >= 5 && canAffordCombo("probe", "normal")) return ["probe", "normal"];
       if (stam >= 4 && canAffordCombo("probe", "probe")) return ["probe", "probe"];
     }
@@ -150,43 +235,45 @@ function chooseAttacks(self, opponent, rules) {
     }
   }
 
-  // 균형 모드 단발
+  // 단발
   if (role === "aggressor") {
     if (canAfford("heavy")) return ["heavy"];
     if (canAfford("normal")) return ["normal"];
     if (canAfford("probe")) return ["probe"];
   }
   if (role === "evader") {
-    // 회피형 평소엔 견제로 모으기, 자원 풍부하면 일반공
     if (stam >= 4 && canAfford("normal")) return ["normal"];
     if (canAfford("probe")) return ["probe"];
     if (canAfford("normal")) return ["normal"];
   }
-  // balanced
   if (canAfford("normal")) return ["normal"];
   if (canAfford("probe")) return ["probe"];
 
-  // 자원 부족 — 휴식 또는 견제 강행
   if (A.rest.enabled) return ["rest"];
   return ["probe"];
 }
 
-// 빌드 정체성 + 상황 기반 AI: 방어 선택
+// 빌드 정체성 + 상황 + 페르소나 기반 AI: 방어 선택
 // incomingAttacks: 들어오는 공격 키 배열 (예: ["heavy", "normal"])
-function chooseDefense(self, opponent, rules, incomingAttacks) {
+// difficulty: easy면 회피·반격 덜 활용 (개선안 B)
+function chooseDefense(self, opponent, rules, incomingAttacks, difficulty = "normal") {
   const D = rules.defense;
+  const persona = getPersona(self, difficulty);
   const role = judgeRole(self);
-  const situation = judgeSituation(self, opponent, rules);
+  const situation = judgeSituation(self, opponent, rules, persona);
   const counterOk = canUseCounter(self);
+  // easy 난이도: 일정 확률로 무조건 방어(block)만 (회피·반격 활용 못 함)
+  const dumbDefense = difficulty === "easy" && persona.mistakeRate && Math.random() < persona.mistakeRate * 1.5;
 
   const choices = [];
   for (let i = 0; i < incomingAttacks.length; i++) {
+    if (dumbDefense) { choices.push("block"); continue; }
     const usedFocus = choices.reduce((s, c) => s + (D[c]?.cost || 0), 0);
     const foc = self.focus - usedFocus;
     const incoming = incomingAttacks[i];
     const dmg = rules.attack[incoming]?.damage || 0;
 
-    // 위기 모드 — 반격 우선 (러브샷 카운터)
+    // 위기 모드 — 반격 최우선 (개선안 1): 공격이 빗나가도 자기 반격 굴림 발동 → 위기 탈출 기회
     if (situation === "crisis") {
       if (counterOk && D.counter.enabled && foc >= D.counter.cost) {
         choices.push("counter"); continue;
@@ -199,9 +286,15 @@ function chooseDefense(self, opponent, rules, incomingAttacks) {
     }
 
     // 들어오는 공격 데미지 기반 결정
-    // 강공급 (dmg >= 25) — 가장 위험, 회피·반격 우선
+    // 강공급 (dmg >= 25) — 가장 위험. 회피형은 회피, 공격형도 반격 활용 (개선안 4)
     if (dmg >= 25) {
+      // 회피형: 반격 1순위 (회피 능력 높음 + 카운터)
       if (role === "evader" && counterOk && D.counter.enabled && foc >= D.counter.cost) {
+        choices.push("counter"); continue;
+      }
+      // 공격형: 반격이 회피보다 유효 (반격 굴림에 근력 반영). 자원 여유 있으면 반격
+      if (role === "aggressor" && counterOk && D.counter.enabled && foc >= D.counter.cost
+          && self.str >= self.agi) {
         choices.push("counter"); continue;
       }
       if (D.dodge.enabled && foc >= D.dodge.cost) {
@@ -222,7 +315,10 @@ function chooseDefense(self, opponent, rules, incomingAttacks) {
         }
       }
       if (role === "aggressor") {
-        // 공격형은 자원 아끼기 우선 — 다음 공격에 쓰려고
+        // 공격형: 열세면 반격으로 반전 시도 (자원 여유 시), 아니면 자원 아껴 방어
+        if (situation === "losing" && counterOk && D.counter.enabled && foc >= D.counter.cost + D.block.cost) {
+          choices.push("counter"); continue;
+        }
         if (situation === "losing" && D.dodge.enabled && foc >= D.dodge.cost) {
           choices.push("dodge"); continue;
         }
@@ -1171,6 +1267,7 @@ function DuelTab({ rules, updateRule, requestCopy }) {
   const [showOpponentResources, setShowOpponentResources] = useState(false);
   const [allowUndo, setAllowUndo] = useState(true);
   const [useCheeryTone, setUseCheeryTone] = useState(true);
+  const [difficulty, setDifficulty] = useState("normal"); // easy | normal | hard (개선안 B)
 
   // 누적 통계 로드
   const [stats, setStats] = useState({});
@@ -1228,6 +1325,14 @@ function DuelTab({ rules, updateRule, requestCopy }) {
     else if (initMode === "ai") firstActor = "ai";
     else firstActor = Math.random() < 0.5 ? "me" : "ai";
 
+    // 개선안 F — 패배 학습: 이 빌드가 플레이어에게 자주 졌으면(내 승률 60%+) 적응 모드
+    const buildStat = stats[aiBuild.id];
+    let adaptMode = false;
+    if (buildStat && buildStat.games >= 3) {
+      const myWinRate = buildStat.wins / buildStat.games;
+      if (myWinRate >= 0.6) adaptMode = true;
+    }
+
     const newBattle = {
       me: {
         hp: rules.hp, maxHp: rules.hp,
@@ -1245,7 +1350,7 @@ function DuelTab({ rules, updateRule, requestCopy }) {
       },
       round: 1,
       currentTurn: firstActor === "me" ? "me_attack" : "ai_attack",
-      log: [{ type: "init", firstActor, aiName: aiBuild.name, aiStr: aiBuild.str, aiAgi: aiBuild.agi, mode: initMode }],
+      log: [{ type: "init", firstActor, aiName: aiBuild.name, aiStr: aiBuild.str, aiAgi: aiBuild.agi, mode: initMode, adaptMode }],
       pendingAttacks: null,
       pendingMyAttack: [],
       firstActor,
@@ -1253,6 +1358,7 @@ function DuelTab({ rules, updateRule, requestCopy }) {
       firstDone: false, // 첫 행동 완료 여부 (라운드 내)
       ended: false,
       winner: null,
+      adaptMode, // 개선안 F — 패배 학습 활성 여부
       myActionCounts: { probe: 0, normal: 0, heavy: 0, rest: 0, block: 0, dodge: 0, counter: 0, double: 0 },
       aiActionCounts: { probe: 0, normal: 0, heavy: 0, rest: 0, block: 0, dodge: 0, counter: 0, double: 0 },
       undoSnapshot: null,
@@ -1274,8 +1380,12 @@ function DuelTab({ rules, updateRule, requestCopy }) {
 
       const cur = prev;
       const ai = cur.ai, me = cur.me;
-      const attacks = chooseAttacks(ai, me, rules);
-      const thinking = generateThinking(ai, me, rules, attacks, "attack");
+      // 개선안 F — 적응 모드면 난이도 한 단계 상향 (더 공격적·최적)
+      const effDifficulty = cur.adaptMode
+        ? (difficulty === "easy" ? "normal" : "hard")
+        : difficulty;
+      const attacks = chooseAttacks(ai, me, rules, showOpponentResources, effDifficulty);
+      const thinking = generateThinking(ai, me, rules, attacks, "attack", showOpponentResources);
       const lineKey = attacks[0] === "rest" ? "attack_rest"
                     : attacks[0] === "heavy" ? "attack_heavy"
                     : attacks[0] === "normal" ? "attack_normal"
@@ -1374,9 +1484,12 @@ function DuelTab({ rules, updateRule, requestCopy }) {
     const me = { ...state.me, stamina: state.me.stamina - staminaUsed };
     const newLog = [...state.log, { type: "me_declare", attacks, round: state.round }];
 
-    // AI 방어 결정
-    const defenses = chooseDefense(state.ai, me, rules, attacks);
-    const aiThinking = generateThinking(state.ai, me, rules, attacks, "defense");
+    // AI 방어 결정 (개선안 F — 적응 모드면 난이도 상향)
+    const effDiff = state.adaptMode
+      ? (difficulty === "easy" ? "normal" : "hard")
+      : difficulty;
+    const defenses = chooseDefense(state.ai, me, rules, attacks, effDiff);
+    const aiThinking = generateThinking(state.ai, me, rules, attacks, "defense", showOpponentResources);
     const defLineKey = defenses[0] === "counter" ? "defense_counter"
                      : defenses[0] === "dodge" ? "defense_dodge"
                      : "defense_block";
@@ -1554,6 +1667,7 @@ function DuelTab({ rules, updateRule, requestCopy }) {
         showOpponentResources={showOpponentResources} setShowOpponentResources={setShowOpponentResources}
         allowUndo={allowUndo} setAllowUndo={setAllowUndo}
         useCheeryTone={useCheeryTone} setUseCheeryTone={setUseCheeryTone}
+        difficulty={difficulty} setDifficulty={setDifficulty}
         stats={stats}
         onStart={startBattle}
       />
@@ -1605,45 +1719,75 @@ function DuelTab({ rules, updateRule, requestCopy }) {
 }
 
 // AI 사고 텍스트 생성
-function generateThinking(self, opp, rules, actions, type) {
+function generateThinking(self, opp, rules, actions, type, opponentVisible = false) {
   const sit = judgeSituation(self, opp, rules);
   const sitLabel = { crisis: "위기", dominant: "우세", losing: "열세", even: "균형" }[sit];
   const role = judgeRole(self);
   const roleLabel = { aggressor: "공격형", evader: "회피형", balanced: "균형형" }[role];
+  const dodgeCost = rules.defense.dodge.cost;
+
+  // 위기 사유 구체화 (개선안 6): HP는 충분한데 자원 부족으로 위기 판정된 경우
+  let sitDetail = sitLabel;
+  if (sit === "crisis" && self.hp >= 30) {
+    sitDetail = "위기(자원고갈)";
+  }
 
   if (type === "attack") {
     const actNames = actions.map(a => ({ probe: "견제", normal: "일반공", heavy: "강공", rest: "휴식" }[a])).join(" + ");
     let reason = "";
 
-    // 자원 부족으로 강제 선택된 경우 감지
     const wantedHeavy = (sit === "losing" || sit === "crisis");
     const usedHeavy = actions.includes("heavy");
     const usedNormal = actions.includes("normal");
     const A = rules.attack;
     const canHeavy = A.heavy.enabled && self.stamina >= A.heavy.cost;
-    const canNormal = A.normal.enabled && self.stamina >= A.normal.cost;
+    const isDouble = actions.length > 1;
+
+    // 상대 자원 활용 (개선안 5, 공개 모드)
+    const opponentLowDefense = opponentVisible && opp.focus < dodgeCost;
+    const counterCost = rules.defense.counter.cost;
+    const opponentDefenseless = opponentVisible && opp.focus < dodgeCost && opp.focus < counterCost;
 
     if (actions[0] === "rest") {
-      reason = "자원 부족 — 휴식으로 회복";
+      // 개선안 E — 선제 휴식 구분
+      if (sit === "dominant") reason = "우세 — 선제 휴식(다음 큰 공격 준비)";
+      else if (sit === "even" && self.stamina < A.heavy.cost) reason = "선제 휴식 — 강공 자원 모으기";
+      else reason = "자원 부족 — 휴식으로 회복";
+    } else if (opponentDefenseless && usedHeavy) {
+      // 개선안 C — 방어 무력화 윈도우
+      reason = `상대 방어 무력화(◈${opp.focus}, 회피·반격 불가) — 강공 집중`;
+    } else if (opponentLowDefense && usedHeavy) {
+      reason = `상대 회피자원 부족(◈${opp.focus}) — 강공 push`;
     } else if (wantedHeavy && !usedHeavy && !canHeavy) {
       reason = `${sitLabel} — 강공 노렸으나 자원 부족, ${usedNormal ? "일반공" : "견제"}로 대체`;
     } else if (sit === "crisis") {
-      reason = "위기 — 한 방 노림";
+      reason = self.hp >= 30 ? "자원 고갈 — 승부수" : "위기 — 한 방 노림";
     } else if (sit === "dominant") {
-      if (actions.length > 1) reason = "우세 — 모은 자원 폭발";
-      else reason = "우세 — 자원 모으기";
+      reason = isDouble ? "우세 — 모은 자원 폭발" : "우세 — 자원 모으기";
     } else if (sit === "losing") {
       reason = "열세 — 뒤집기 시도";
+    } else if (isDouble) {
+      reason = `${roleLabel} 더블 콤보 (다음 자원 확보 판단)`;
     } else {
-      if (actions.length > 1) reason = `${roleLabel} 더블 콤보`;
-      else reason = `${roleLabel} 기본 패턴`;
+      reason = `${roleLabel} 기본 패턴`;
     }
-    return `상황: ${sitLabel} (HP ${self.hp} vs ${opp.hp}) / 자원: ⚡${self.stamina} ◈${self.focus} / 선택: ${actNames} (${reason})`;
+
+    let extra = "";
+    if (opponentVisible) extra = ` / 상대자원: ⚡${opp.stamina} ◈${opp.focus}`;
+    return `상황: ${sitDetail} (HP ${self.hp} vs ${opp.hp}) / 자원: ⚡${self.stamina} ◈${self.focus}${extra} / 선택: ${actNames} (${reason})`;
   }
 
   // defense
   const incoming = actions.map(a => ({ probe: "견제", normal: "일반공", heavy: "강공", rest: "휴식" }[a])).join(" + ");
-  return `상황: ${sitLabel} / 들어오는 공격: ${incoming} / 자원: ◈${self.focus} → 빌드(${roleLabel}) 패턴으로 방어 결정`;
+  const counterOk = canUseCounter(self);
+  const maxDmg = Math.max(...actions.map(a => rules.attack[a]?.damage || 0));
+
+  let defReason = `빌드(${roleLabel}) 패턴`;
+  if (sit === "crisis" && counterOk) defReason = "위기 — 반격으로 반전 시도";
+  else if (maxDmg >= 25 && role === "aggressor" && counterOk) defReason = "강공 — 공격형도 반격 유효(근력 반영)";
+  else if (maxDmg >= 25 && role === "evader") defReason = "강공 — 회피/반격 우선";
+
+  return `상황: ${sitDetail} / 들어오는 공격: ${incoming} / 자원: ◈${self.focus} → ${defReason}`;
 }
 
 // ============================================================
@@ -1657,6 +1801,7 @@ function DuelSetupScreen({
   showOpponentResources, setShowOpponentResources,
   allowUndo, setAllowUndo,
   useCheeryTone, setUseCheeryTone,
+  difficulty, setDifficulty,
   stats, onStart,
 }) {
   const [newBuildForm, setNewBuildForm] = useState(null);
@@ -1761,6 +1906,23 @@ function DuelSetupScreen({
                   {l}
                 </button>
               ))}
+            </div>
+          </div>
+
+          <div className="mb-3">
+            <div className="text-xs text-zinc-400 mb-1">AI 난이도</div>
+            <div className="grid grid-cols-3 gap-1">
+              {[["easy", "초급"], ["normal", "중급"], ["hard", "고급"]].map(([v, l]) => (
+                <button key={v} onClick={() => setDifficulty(v)}
+                  className={`py-1.5 rounded text-xs transition ${difficulty === v ? "bg-emerald-700 text-white" : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"}`}>
+                  {l}
+                </button>
+              ))}
+            </div>
+            <div className="text-[10px] text-zinc-600 mt-1">
+              {difficulty === "easy" && "실수 잦음, 회피·반격 잘 안 씀"}
+              {difficulty === "normal" && "기본 전략, 가끔 실수"}
+              {difficulty === "hard" && "최적 운영, 상대 자원 파악(공개 시), 실수 없음"}
             </div>
           </div>
 
@@ -2008,6 +2170,7 @@ function LogEntry({ entry: l }) {
     return (
       <div className="text-center text-[10px] text-zinc-500 py-1">
         전투 시작 · {l.firstActor === "me" ? "내" : l.aiName} 선공 · AI: {l.aiName} (근{l.aiStr} 회{l.aiAgi})
+        {l.adaptMode && <div className="text-rose-400 mt-0.5">⚡ AI 적응 모드 — 이전 패배를 학습해 더 강하게 싸웁니다</div>}
       </div>
     );
   }
